@@ -1,0 +1,159 @@
+name: Repack Joplin (win-x64, no OCR / no AI)
+
+on:
+  # 每天 北京时间 08:20 (UTC 00:20) 检查上游一次（GitHub 的 cron 是尽力而为，避开整点）
+  schedule:
+    - cron: '20 0 * * *'
+
+  # 从外部触发，例如：
+  #   curl -X POST -H "Accept: application/vnd.github+json" \
+  #        -H "Authorization: Bearer $TOKEN" \
+  #        https://api.github.com/repos/<you>/<repo>/dispatches \
+  #        -d '{"event_type":"joplin-release"}'
+  repository_dispatch:
+    types: [joplin-release]
+
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild even if this version already exists'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# 与 Android 工作流各用各的并发组，两边互不取消
+concurrency:
+  group: joplin-repack-win-x64
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: laurent22/joplin
+  # 0 = 不压缩（最快），9 = 最小（最慢）
+  COMPRESS_LEVEL: '7'
+  # --------------------------------------------------------------- 更新地址 --
+  # 软件更新地址：指向本仓库（"这个地址"）的 Releases。
+  # Joplin 的"检查更新"请求的就是 GitHub Releases API 形状的 JSON，
+  # 所以这里换成任何同形状的地址都可以。
+  # 要指向别处，只改下面这两行即可，两个平台语义一致。
+  UPDATE_FEED_URL: 'https://api.github.com/repos/${{ github.repository }}/releases'
+  UPDATE_REPO: '${{ github.repository }}'
+
+jobs:
+  repack:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream release
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$UPSTREAM_REPO/releases/latest" > upstream.json
+
+          TAG="$(jq -r '.tag_name // empty' upstream.json)"
+          if [ -z "$TAG" ]; then
+            echo "::error::cannot read the latest release of $UPSTREAM_REPO"
+            exit 1
+          fi
+          echo "latest upstream release: $TAG"
+
+          # 只要 Windows x64 的 .exe —— 跳过 ia32 / x86 / arm64 / blockmap / 非 Windows
+          mapfile -t ASSETS < <(jq -r '.assets[]?.name // empty' upstream.json \
+            | grep -E '\.exe$' | grep -vi 'blockmap' | grep -viE 'ia32|x86|arm64' || true)
+
+          NAME=""
+          if [ ${#ASSETS[@]} -gt 0 ]; then
+            for a in "${ASSETS[@]}"; do case "$a" in *Setup*) NAME="$a"; break;; esac; done
+            if [ -z "$NAME" ]; then
+              for a in "${ASSETS[@]}"; do case "$a" in *Portable*) NAME="$a"; break;; esac; done
+            fi
+            if [ -z "$NAME" ]; then NAME="${ASSETS[0]}"; fi
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$NAME" ]; then
+            echo "::warning::the Windows x64 asset of $TAG is not uploaded yet, retrying later"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "selected asset: $NAME"
+
+          # 同一个 tag 的 Release 由两个平台共用（Android 工作流也会往里传资产），
+          # 所以这里只判断"本平台自己的资产"在不在，别人有没有资产与本次无关。
+          if [ "$FORCE" != "true" ] && gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+               --json assets --jq '.assets[]?.name' 2>/dev/null \
+               | grep -qx "Joplin-${TAG#v}-win-x64-noocr-noai.7z"; then
+            echo "$TAG was already repacked, nothing to do"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "url=https://github.com/$UPSTREAM_REPO/releases/download/$TAG/$NAME" >> "$GITHUB_OUTPUT"
+          echo "build=true" >> "$GITHUB_OUTPUT"
+
+      - name: Install packaging tools
+        if: steps.resolve.outputs.build == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends p7zip-full
+          # 新版 7-Zip（7zz）对 NSIS 安装包的处理明显好于 p7zip 16.02
+          sudo apt-get install -y --no-install-recommends 7zip || true
+          # 用来解包 / 重打包 resources/app.asar
+          sudo npm install -g @electron/asar
+
+      - name: Repack (x64 only, OCR + AI stripped)
+        if: steps.resolve.outputs.build == 'true'
+        env:
+          STRIP_AI: 'true'
+          KEEP_LOCALES: 'en-US.pak zh-CN.pak'
+          KEEP_EDITOR_LOCALES: 'en* zh*'
+          # Joplin 自己的界面翻译是编译进 JS bundle 的，这里把所有语言 id
+          # 不以这些前缀开头的翻译裁掉。
+          TRIM_UI_LOCALES: 'true'
+          KEEP_UI_LOCALES: 'en zh'
+          # 把"检查更新"指向本仓库（GitHub 的 Releases API 返回同样的 JSON 结构）。
+          UPDATE_FEED_URL: ${{ env.UPDATE_FEED_URL }}
+          UPDATE_REPO: ${{ env.UPDATE_REPO }}
+          # 可选：删掉 dxcompiler.dll / dxil.dll / vk_swiftshader.dll / ffmpeg.dll
+          # （解包后约 35 MB）。Electron 官方不支持，先测再开。
+          STRIP_RUNTIME_EXTRAS: 'false'
+        run: |
+          bash scripts/repack.sh \
+            "${{ steps.resolve.outputs.tag }}" \
+            "${{ steps.resolve.outputs.url }}"
+
+      - name: Publish release
+        if: steps.resolve.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          FILES=(dist/*.7z dist/sha256.txt)
+          shopt -u nullglob
+
+          TAG="${{ steps.resolve.outputs.tag }}"
+
+          # Android 工作流会把资产发布到同一个 tag 的 Release 里，
+          # 所以已存在时只补充/覆盖本平台自己的资产，绝不动别人的。
+          # （因此这里也不再像原来那样 force 时删 Release —— 那会把 APK 一起删掉。）
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${FILES[@]}" \
+              --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" "${FILES[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Joplin ${{ steps.resolve.outputs.version }}" \
+              --notes-file dist/RELEASE_NOTES.md
+          fi
+          echo "### Repacked $TAG" >> "$GITHUB_STEP_SUMMARY"
+          ls -lh dist >> "$GITHUB_STEP_SUMMARY"

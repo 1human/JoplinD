@@ -1,0 +1,402 @@
+name: Build Joplin Android ARM64
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Joplin version, e.g. v3.7.16. Leave empty for latest."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+# 与 win-x64 工作流各用各的并发组，两边互不取消
+concurrency:
+  group: build-android-arm64
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: laurent22/joplin
+  # --------------------------------------------------------------- 更新地址 --
+  # 软件更新地址：指向本仓库（"这个地址"）的 Releases。
+  # 说明：Joplin 移动端目前没有内置的应用内更新检查，所以下面的
+  # "Point the update check at this repository" 步骤在找不到端点时会直接跳过；
+  # 一旦上游加入该功能，同一地址就会被自动写入。详见 README。
+  UPDATE_FEED_URL: 'https://api.github.com/repos/${{ github.repository }}/releases'
+  UPDATE_REPO: '${{ github.repository }}'
+  PATCH_UPDATE_FEED: 'true'
+
+jobs:
+  check-release:
+    name: Check Official Release
+    runs-on: ubuntu-latest
+
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      version: ${{ steps.check.outputs.version }}
+
+    steps:
+      - name: Check upstream latest release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANUAL_VERSION: ${{ inputs.version }}
+        run: |
+          set -e
+
+          if [ -n "$MANUAL_VERSION" ]; then
+            VERSION="$MANUAL_VERSION"
+          else
+            VERSION=$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq '.tag_name')
+          fi
+
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: Could not determine version."
+            exit 1
+          fi
+
+          # Tags are always "vX.Y.Z" - tolerate a bare "3.7.16" manual input.
+          case "$VERSION" in
+            v*) ;;
+            *) VERSION="v${VERSION}" ;;
+          esac
+
+          echo "Joplin version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # 同一个 tag 的 Release 与 win-x64 工作流共用，所以只判断
+          # "本平台自己的 APK" 在不在，win-x64 的资产与本平台无关。
+          APK="joplin-${VERSION#v}-arm64.apk"
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json assets \
+               --jq '.assets[]?.name' 2>/dev/null | grep -qx "$APK"; then
+            echo "Release $VERSION already contains $APK."
+            if [ "${{ github.event_name }}" = "schedule" ]; then
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "Manual or push trigger: building anyway to update assets."
+              echo "should_build=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "Release $VERSION does not contain $APK yet."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build ARM64 APK
+    needs: check-release
+    if: needs.check-release.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout official Joplin release
+        uses: actions/checkout@v4
+        with:
+          repository: laurent22/joplin
+          ref: ${{ needs.check-release.outputs.version }}
+          fetch-depth: 1
+
+      - name: Point the update check at this repository
+        if: env.PATCH_UPDATE_FEED == 'true'
+        env:
+          FEED: ${{ env.UPDATE_FEED_URL }}
+          REPO: ${{ env.UPDATE_REPO }}
+        run: |
+          set -euo pipefail
+
+          # Joplin 官方的更新检查端点。桌面端用第一个，移动端若将来加入
+          # 应用内更新检查用的也会是同一形状的地址，所以一并处理。
+          PATTERNS=(
+            'https://objects\.joplinusercontent\.com/r/releases'
+            'https://api\.github\.com/repos/laurent22/joplin-android/releases'
+            'https://api\.github\.com/repos/laurent22/joplin/releases'
+          )
+
+          hits=0
+          for p in "${PATTERNS[@]}"; do
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              sed -i -E "s|$p|$FEED|g" "$f"
+              echo "  replaced in $f"
+              hits=$(( hits + 1 ))
+            done < <(grep -rlE "$p" packages/app-mobile \
+                       --include='*.ts' --include='*.tsx' \
+                       --include='*.js' --include='*.json' 2>/dev/null || true)
+          done
+
+          if [ "$hits" -eq 0 ]; then
+            echo "上游源码里没有内置的更新检查端点（Joplin 移动端不支持应用内自动更新），已跳过。"
+            echo "APK 的更新来源就是本仓库的 Release 页面：https://github.com/$REPO/releases"
+          else
+            echo "已把 $hits 处更新端点改写为 $FEED"
+          fi
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsecret-1-dev
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/share/swift || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf /usr/local/share/powershell || true
+          docker system prune -af || true
+          df -h /
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "20"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: yarn
+
+      - name: Enable Corepack (Yarn 4)
+        # Joplin pins yarn@4.16.0 via "packageManager". The runner's default
+        # yarn is 1.x, which cannot read the Yarn 4 lockfile nor the
+        # workspace: protocol, so "yarn install" would fail.
+        env:
+          COREPACK_NETWORK_TIMEOUT: "60000"
+        run: |
+          corepack enable
+          for i in 1 2 3; do
+            if corepack prepare --activate; then break; fi
+            echo "corepack prepare failed (attempt $i), retrying in 15s..."
+            sleep 15
+          done
+          yarn --version
+
+      - name: Install dependencies
+        run: |
+          ok=false
+          for i in 1 2 3; do
+            if yarn install; then
+              ok=true
+              break
+            fi
+            echo "yarn install failed (attempt $i), retrying in 30s..."
+            sleep 30
+          done
+          if [ "$ok" != "true" ]; then
+            echo "ERROR: yarn install failed after 3 attempts."
+            exit 1
+          fi
+        env:
+          SKIP_ONENOTE_CONVERTER_BUILD: "1"
+
+      - name: Force ARM64 and Enable Compression (R8)
+        working-directory: packages/app-mobile/android
+        run: |
+          # 1. Update gradle.properties
+          if grep -q "^reactNativeArchitectures=" gradle.properties; then
+            sed -i 's/^reactNativeArchitectures=.*/reactNativeArchitectures=arm64-v8a/' gradle.properties
+          else
+            echo "reactNativeArchitectures=arm64-v8a" >> gradle.properties
+          fi
+
+          # WARNING: upstream Joplin never enables minify (default is false) and
+          # app/proguard-rules.pro only holds a single -keep rule, so R8 can
+          # strip code that is needed at runtime. Set this to false if the
+          # resulting APK crashes on launch.
+          if grep -q "android.enableMinifyInReleaseBuilds" gradle.properties; then
+            sed -i 's/^android.enableMinifyInReleaseBuilds=.*/android.enableMinifyInReleaseBuilds=true/' gradle.properties
+          else
+            echo "android.enableMinifyInReleaseBuilds=true" >> gradle.properties
+          fi
+
+          echo "Updated gradle.properties:"
+          grep -E "reactNativeArchitectures|enableMinifyInReleaseBuilds" gradle.properties
+
+          # 2. Update build.gradle for ABI filters
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          path = Path("app/build.gradle")
+          text = path.read_text()
+
+          pattern = r'abiFilters\s+["\'][^"\']+["\'](?:,\s+["\'][^"\']+["\'])*'
+          if re.search(pattern, text):
+              text = re.sub(pattern, 'abiFilters "arm64-v8a"', text)
+              path.write_text(text)
+              print("Changed abiFilters to arm64-v8a")
+          PY
+
+      - name: Prepare signing configuration
+        working-directory: packages/app-mobile/android/app
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -e
+
+          # Secret values may contain arbitrary characters, so write them to
+          # $GITHUB_ENV using a heredoc delimiter instead of "key=value".
+          write_env() {
+            {
+              echo "$1<<__JOPLIN_SIGNING__"
+              printf '%s\n' "$2"
+              echo "__JOPLIN_SIGNING__"
+            } >> "$GITHUB_ENV"
+          }
+
+          if [ -n "$SIGNING_KEY" ]; then
+            echo "$SIGNING_KEY" | base64 -d > release.keystore
+            echo "Using the custom release keystore from secrets."
+            write_env JOPLIN_RELEASE_STORE_FILE release.keystore
+            write_env JOPLIN_RELEASE_STORE_PASSWORD "$KEY_STORE_PASSWORD"
+            write_env JOPLIN_RELEASE_KEY_ALIAS "$ALIAS"
+            write_env JOPLIN_RELEASE_KEY_PASSWORD "$KEY_PASSWORD"
+          else
+            echo "No signing secret found - using the built-in debug keystore."
+            write_env JOPLIN_RELEASE_STORE_FILE debug.keystore
+            write_env JOPLIN_RELEASE_STORE_PASSWORD android
+            write_env JOPLIN_RELEASE_KEY_ALIAS androiddebugkey
+            write_env JOPLIN_RELEASE_KEY_PASSWORD android
+          fi
+
+          # app/build.gradle reads these project properties. If a future release
+          # renames them, fail loudly instead of shipping an unsigned APK.
+          if ! grep -q "JOPLIN_RELEASE_STORE_FILE" build.gradle; then
+            echo "ERROR: build.gradle no longer reads JOPLIN_RELEASE_STORE_FILE."
+            exit 1
+          fi
+
+      - name: Build Android Release
+        working-directory: packages/app-mobile/android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease \
+            -PJOPLIN_RELEASE_STORE_FILE="$JOPLIN_RELEASE_STORE_FILE" \
+            -PJOPLIN_RELEASE_STORE_PASSWORD="$JOPLIN_RELEASE_STORE_PASSWORD" \
+            -PJOPLIN_RELEASE_KEY_ALIAS="$JOPLIN_RELEASE_KEY_ALIAS" \
+            -PJOPLIN_RELEASE_KEY_PASSWORD="$JOPLIN_RELEASE_KEY_PASSWORD"
+
+      - name: Verify APK
+        working-directory: packages/app-mobile/android
+        run: |
+          set -e
+
+          APK="app/build/outputs/apk/release/app-release.apk"
+
+          if [ ! -f "$APK" ]; then
+            echo "ERROR: APK not found"
+            exit 1
+          fi
+
+          ls -lh "$APK"
+
+          echo "Checking native libraries..."
+          unzip -l "$APK" | grep "lib/" || true
+
+          if unzip -l "$APK" | grep -E "lib/(armeabi-v7a|x86|x86_64)/"; then
+            echo "ERROR: Non-ARM64 libraries found"
+            exit 1
+          fi
+
+          if ! unzip -l "$APK" | grep "lib/arm64-v8a/"; then
+            echo "ERROR: arm64-v8a libraries not found"
+            exit 1
+          fi
+
+          echo "ARM64 verification PASSED"
+
+      - name: Verify APK alignment
+        working-directory: packages/app-mobile/android
+        run: |
+          set -e
+
+          APK="./app/build/outputs/apk/release/app-release.apk"
+          ZIPALIGN_PATH=$(find "$ANDROID_HOME/build-tools" -name "zipalign" -type f | sort | tail -n1)
+
+          if [ ! -x "$ZIPALIGN_PATH" ]; then
+            echo "ERROR: zipalign not found"
+            exit 1
+          fi
+
+          "$ZIPALIGN_PATH" -c -P 16 -v 4 "$APK"
+
+      - name: Verify APK signature
+        working-directory: packages/app-mobile/android
+        run: |
+          set -e
+
+          APK="app/build/outputs/apk/release/app-release.apk"
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name "apksigner" -type f | sort | tail -n1)
+
+          if [ ! -x "$APKSIGNER" ]; then
+            echo "ERROR: apksigner not found"
+            exit 1
+          fi
+
+          "$APKSIGNER" verify --print-certs "$APK"
+
+      - name: Rename APK
+        run: |
+          VERSION="${{ needs.check-release.outputs.version }}"
+          VERSION_NUMBER="${VERSION#v}"
+
+          cp \
+            packages/app-mobile/android/app/build/outputs/apk/release/app-release.apk \
+            "joplin-${VERSION_NUMBER}-arm64.apk"
+
+      - name: Generate SHA256
+        run: |
+          VERSION="${{ needs.check-release.outputs.version }}"
+          VERSION_NUMBER="${VERSION#v}"
+
+          sha256sum \
+            "joplin-${VERSION_NUMBER}-arm64.apk" \
+            > \
+            "joplin-${VERSION_NUMBER}-arm64.apk.sha256"
+
+          cat "joplin-${VERSION_NUMBER}-arm64.apk.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: joplin-${{ needs.check-release.outputs.version }}-arm64
+          path: |
+            joplin-*-arm64.apk
+            joplin-*-arm64.apk.sha256
+          if-no-files-found: error
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.check-release.outputs.version }}"
+          VERSION_NUMBER="${VERSION#v}"
+          APK="joplin-${VERSION_NUMBER}-arm64.apk"
+          SHA="joplin-${VERSION_NUMBER}-arm64.apk.sha256"
+
+          # win-x64 工作流会把资产发布到同一个 tag 的 Release 里，
+          # 所以已存在时只补充/覆盖本平台自己的资产，绝不动别人的。
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists, uploading assets..."
+            gh release upload "$VERSION" "$APK" "$SHA" \
+              --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            echo "Creating new release $VERSION..."
+            gh release create "$VERSION" "$APK" "$SHA" \
+              --title "Joplin ${VERSION}" \
+              --generate-notes \
+              --repo "$GITHUB_REPOSITORY"
+          fi
