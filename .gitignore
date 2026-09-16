@@ -1,0 +1,6 @@
+work/
+dist/
+upstream.json
+.DS_Store
+.idea/
+*.iml
